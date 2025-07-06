@@ -4,18 +4,38 @@ import CoreGraphics
 import Carbon
 
 // =================================================================================
+// MARK: - Global Hotkey Handler
+// =================================================================================
+// A global function is required for the C-based Carbon API to call into our Swift code.
+// It acts as a stable entry point for the system to call.
+
+func hotkeyHandler(nextHandler: EventHandlerCallRef?, event: EventRef?, userData: UnsafeMutableRawPointer?) -> OSStatus {
+    // Ensure the user data (a pointer to our AppDelegate instance) is valid.
+    guard let userData = userData else { return OSStatus(eventNotHandledErr) }
+
+    // Reconstruct the AppDelegate instance from the raw pointer.
+    let appDelegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+    
+    // Call the instance method on our app delegate to perform the action.
+    appDelegate.hotkeyAction()
+    
+    // Indicate that we have successfully handled the event.
+    return noErr
+}
+
+
+// =================================================================================
 // MARK: - Main Application Entry Point (CursorAnchorApp.swift)
 // =================================================================================
 
 @main
 struct CursorAnchorApp: App {
-    // The @NSApplicationDelegateAdaptor property wrapper creates and manages the app delegate instance.
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     
     var body: some Scene {
         Settings {
-            // The main window is hidden, and the UI is presented in a popover from the menu bar.
-            // We inject the app delegate into the environment so SwiftUI views can access it.
+            // The main window is hidden. We inject the app delegate and its settings
+            // into the environment so all SwiftUI views can access them.
             EmptyView()
                 .environmentObject(appDelegate)
                 .environmentObject(appDelegate.settings)
@@ -28,19 +48,18 @@ struct CursorAnchorApp: App {
 // MARK: - Application Delegate (AppDelegate.swift)
 // =================================================================================
 // The main controller for the application. It manages the app's lifecycle,
-// status bar item, popover, and coordinates actions between other components.
+// status bar item, and coordinates actions between other components.
 
 class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     var statusBarItem: NSStatusItem?
     var popover: NSPopover?
     
-    // --- Centralized settings store ---
-    // The AppDelegate owns the settings store, which manages all saved data.
     @ObservedObject var settings = SettingsStore()
     
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
     private var hotzoneWindows: [NSWindow] = []
+    var preferencesWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         setupStatusBarItem()
@@ -61,30 +80,38 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     
     private func setupPopover() {
         popover = NSPopover()
-        // --- UI CHANGE: Increased popover height ---
-        popover?.contentSize = NSSize(width: 350, height: 340)
+        popover?.contentSize = NSSize(width: 350, height: 280)
         popover?.behavior = .transient
-        // Inject both the AppDelegate and its SettingsStore into the ContentView's environment.
         popover?.contentViewController = NSHostingController(rootView: ContentView()
             .environmentObject(self)
             .environmentObject(settings)
         )
     }
     
+    // MARK: - Settings Management
+    func applySettings(keyCode: Int, modifiers: NSEvent.ModifierFlags, isEnabled: Bool) {
+        print("Applying new settings... KeyCode: \(keyCode), Modifiers: \(modifiers.rawValue), Enabled: \(isEnabled)")
+        settings.hotkeyKeyCode = keyCode
+        settings.hotkeyModifiers = modifiers
+        settings.isHotkeyEnabled = isEnabled
+        
+        if isEnabled {
+            startHotkeyMonitoring()
+        } else {
+            stopHotkeyMonitoring()
+        }
+    }
+    
     // MARK: - Hotzone Management
     func showHotzoneSelection() {
         popover?.performClose(nil)
-        closeHotzoneWindows() // Ensure no old windows are lingering.
+        closeHotzoneWindows()
         
         for screen in NSScreen.screens {
             let controller = HotzoneViewController(); controller.appDelegate = self
             let window = NSWindow(contentViewController: controller)
-            window.styleMask = .borderless
-            window.level = .floating
-            window.isOpaque = false
-            window.backgroundColor = .clear
-            window.setFrame(screen.frame, display: true)
-            window.makeKeyAndOrderFront(nil)
+            window.styleMask = .borderless; window.level = .floating; window.isOpaque = false; window.backgroundColor = .clear
+            window.setFrame(screen.frame, display: true); window.makeKeyAndOrderFront(nil)
             hotzoneWindows.append(window)
         }
     }
@@ -103,13 +130,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         hotzoneWindows.removeAll()
     }
     
+    // MARK: - Preferences Window
+    func showPreferences() {
+        popover?.performClose(nil)
+        if preferencesWindow == nil {
+            let view = PreferencesView().environmentObject(settings).environmentObject(self)
+            preferencesWindow = NSWindow(contentViewController: NSHostingController(rootView: view))
+            preferencesWindow?.styleMask = [.titled, .closable]
+            preferencesWindow?.title = "Cursor Anchor Preferences"
+            preferencesWindow?.delegate = self
+        }
+        preferencesWindow?.center()
+        preferencesWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    
+    func closePreferences() {
+        preferencesWindow?.close()
+    }
+
     // MARK: - Hotkey Monitoring
     func startHotkeyMonitoring() {
         stopHotkeyMonitoring()
         let signature = FourCharCode(1668248441)
         let hotKeyId = EventHotKeyID(signature: signature, id: 1)
         let eventTarget = GetEventDispatcherTarget()
-        let carbonModifiers = UInt32(controlKey | optionKey)
+        
+        // Use the fully customizable key code and modifiers
+        let carbonModifiers = convertToCarbonFlags(settings.hotkeyModifiers)
         let keyCode = UInt32(settings.hotkeyKeyCode)
         
         var status = RegisterEventHotKey(keyCode, carbonModifiers, hotKeyId, eventTarget, 0, &hotKeyRef)
@@ -117,13 +165,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))
         status = InstallEventHandler(eventTarget, hotkeyHandler, 1, &eventType, Unmanaged.passUnretained(self).toOpaque(), &eventHandlerRef)
-        if status == noErr { print("✅ Hotkey registered successfully for key code: \(keyCode)") }
+        if status == noErr { print("✅ Hotkey registered successfully for key code: \(keyCode) with modifiers: \(carbonModifiers)") }
         else { print("❌ ERROR: Failed to install event handler. Status: \(status)") }
     }
     
     func stopHotkeyMonitoring() {
         if let h = hotKeyRef { UnregisterEventHotKey(h); hotKeyRef = nil }
         if let h = eventHandlerRef { RemoveEventHandler(h); eventHandlerRef = nil }
+    }
+    
+    private func convertToCarbonFlags(_ flags: NSEvent.ModifierFlags) -> UInt32 {
+        var carbonFlags: UInt32 = 0
+        if flags.contains(.control) { carbonFlags |= UInt32(controlKey) }
+        if flags.contains(.option) { carbonFlags |= UInt32(optionKey) }
+        if flags.contains(.shift) { carbonFlags |= UInt32(shiftKey) }
+        if flags.contains(.command) { carbonFlags |= UInt32(cmdKey) }
+        return carbonFlags
     }
     
     @objc func hotkeyAction() {
@@ -135,7 +192,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         if let point = settings.getHotzone() {
             CGWarpMouseCursorPosition(point)
         } else {
-            // Fallback to center of the main screen if no hotzone is set.
             guard let mainScreen = NSScreen.main else { return }
             CGWarpMouseCursorPosition(CGPoint(x: mainScreen.frame.midX, y: mainScreen.frame.midY))
         }
@@ -148,40 +204,44 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 }
 
+extension AppDelegate: NSWindowDelegate {
+    func windowWillClose(_ notification: Notification) {
+        if (notification.object as? NSWindow) == preferencesWindow {
+            preferencesWindow?.makeFirstResponder(nil)
+            preferencesWindow = nil
+        }
+    }
+}
 
 // =================================================================================
 // MARK: - Settings Store (SettingsStore.swift)
 // =================================================================================
-// This class centralizes all logic for loading and saving application settings
-// from UserDefaults, acting as the single source of truth for the app's state.
 
 class SettingsStore: ObservableObject {
-    // --- @Published properties will automatically notify any listening SwiftUI views of changes. ---
-    
     @Published var isHotkeyEnabled: Bool {
         didSet { UserDefaults.standard.set(isHotkeyEnabled, forKey: "isHotkeyEnabled") }
     }
-    
     @Published var hotkeyKeyCode: Int {
         didSet { UserDefaults.standard.set(hotkeyKeyCode, forKey: "hotkeyKeyCode") }
     }
-    
+    @Published var hotkeyModifiers: NSEvent.ModifierFlags {
+        didSet { UserDefaults.standard.set(hotkeyModifiers.rawValue, forKey: "hotkeyModifiers") }
+    }
     @Published var hotzoneDescription: String {
         didSet { UserDefaults.standard.set(hotzoneDescription, forKey: "hotzoneDescription") }
     }
-    
     private var hotzoneX: Double? {
         didSet { UserDefaults.standard.set(hotzoneX, forKey: "hotzoneX") }
     }
-    
     private var hotzoneY: Double? {
         didSet { UserDefaults.standard.set(hotzoneY, forKey: "hotzoneY") }
     }
 
     init() {
-        // Load values from UserDefaults on initialization, providing default values.
         self.isHotkeyEnabled = UserDefaults.standard.object(forKey: "isHotkeyEnabled") as? Bool ?? true
         self.hotkeyKeyCode = UserDefaults.standard.object(forKey: "hotkeyKeyCode") as? Int ?? kVK_ANSI_C
+        let storedModifiers = UserDefaults.standard.object(forKey: "hotkeyModifiers") as? UInt ?? (NSEvent.ModifierFlags.control.rawValue | NSEvent.ModifierFlags.option.rawValue)
+        self.hotkeyModifiers = NSEvent.ModifierFlags(rawValue: storedModifiers)
         self.hotzoneDescription = UserDefaults.standard.string(forKey: "hotzoneDescription") ?? "Not Defined"
         self.hotzoneX = UserDefaults.standard.object(forKey: "hotzoneX") as? Double
         self.hotzoneY = UserDefaults.standard.object(forKey: "hotzoneY") as? Double
@@ -201,7 +261,7 @@ class SettingsStore: ObservableObject {
 
 
 // =================================================================================
-// MARK: - SwiftUI Views (ContentView.swift)
+// MARK: - SwiftUI Views (All Views)
 // =================================================================================
 
 // The main view shown in the popover.
@@ -212,44 +272,88 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 20) {
             Text("Cursor Anchor").font(.largeTitle).fontWeight(.bold)
-            
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading) {
                 Text("Current Hotzone:").font(.headline)
-                Text(settings.hotzoneDescription) // Read directly from settings
+                Text(settings.hotzoneDescription)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
             Button("Define/Redefine Hotzone") { appDelegate.showHotzoneSelection() }
-            
             Divider()
-            
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Global Hotkey:").font(.headline)
-                Text(HotkeyManager.hotkeyToString(keyCode: settings.hotkeyKeyCode)) // Read directly from settings
-                    .padding(8).background(Color(.windowBackgroundColor)).cornerRadius(6)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            
-            Toggle("Enable Hotkey", isOn: $settings.isHotkeyEnabled) // Bind directly to settings
-                .onChange(of: settings.isHotkeyEnabled) { _, isEnabled in
-                    // Tell the app delegate to update the hotkey registration status.
-                    if isEnabled {
-                        appDelegate.startHotkeyMonitoring()
-                    } else {
-                        appDelegate.stopHotkeyMonitoring()
-                    }
-                }
-            
-            Spacer()
-            
-            Button("Quit Cursor Anchor") { NSApp.terminate(nil) }
+            Button("Preferences...") { appDelegate.showPreferences() }
+            Button("Quit") { NSApp.terminate(nil) }
         }
-        .padding()
-        // --- UI CHANGE: Increased frame height ---
-        .frame(width: 350, height: 340)
+        .padding().frame(width: 350, height: 280)
     }
 }
 
+// The dedicated view for all preferences.
+struct PreferencesView: View {
+    @EnvironmentObject var appDelegate: AppDelegate
+    @EnvironmentObject var settings: SettingsStore
+    
+    @State private var tempKeyCode: Int
+    @State private var tempModifiers: NSEvent.ModifierFlags
+    @State private var tempIsEnabled: Bool
+    
+    init() {
+        _tempKeyCode = State(initialValue: 0)
+        _tempModifiers = State(initialValue: [])
+        _tempIsEnabled = State(initialValue: true)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Text("General").font(.title2).fontWeight(.bold)
+            Toggle("Enable Hotkey", isOn: $tempIsEnabled)
+            
+            Divider()
+
+            Text("Hotkey").font(.title2).fontWeight(.bold)
+            Text("Click the field below and press a key combination.")
+            HotkeyRecorder(keyCode: $tempKeyCode, modifiers: $tempModifiers)
+                .frame(width: 200, height: 24)
+            
+            Spacer()
+            
+            HStack {
+                Spacer()
+                Button("Cancel") { appDelegate.closePreferences() }
+                Button("Save") {
+                    appDelegate.applySettings(keyCode: tempKeyCode, modifiers: tempModifiers, isEnabled: tempIsEnabled)
+                    appDelegate.closePreferences()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding()
+        .frame(width: 450, height: 300)
+        .onAppear {
+            self.tempKeyCode = settings.hotkeyKeyCode
+            self.tempModifiers = settings.hotkeyModifiers
+            self.tempIsEnabled = settings.isHotkeyEnabled
+        }
+    }
+}
+
+// A wrapper to make the KeyCaptureField usable in SwiftUI.
+struct HotkeyRecorder: NSViewRepresentable {
+    @Binding var keyCode: Int
+    @Binding var modifiers: NSEvent.ModifierFlags
+
+    func makeNSView(context: Context) -> KeyCaptureField {
+        let field = KeyCaptureField()
+        field.onValueChange = { newCode, newModifiers in
+            self.keyCode = newCode
+            self.modifiers = newModifiers
+        }
+        return field
+    }
+
+    func updateNSView(_ nsView: KeyCaptureField, context: Context) {
+        // This is the single source of truth for the view's appearance.
+        // It's called whenever the @State in the parent view changes.
+        nsView.stringValue = HotkeyManager.hotkeyToString(keyCode: keyCode, modifiers: modifiers)
+    }
+}
 
 // =================================================================================
 // MARK: - Hotzone Selection Components (HotzoneSelection.swift)
@@ -284,26 +388,63 @@ class HotzoneSelectionView: NSView {
     }
 }
 
-
 // =================================================================================
 // MARK: - Hotkey Helpers (HotkeyManager.swift)
 // =================================================================================
 
-// A global function is required for the C-based Carbon API to call into Swift.
-func hotkeyHandler(nextHandler: EventHandlerCallRef?, event: EventRef?, userData: UnsafeMutableRawPointer?) -> OSStatus {
-    guard let userData = userData else { return OSStatus(eventNotHandledErr) }
-    let appDelegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
-    appDelegate.hotkeyAction()
-    return noErr
+// A custom text field for recording hotkeys.
+class KeyCaptureField: NSTextField {
+    var onValueChange: (Int, NSEvent.ModifierFlags) -> Void = { _,_  in }
+    
+    override func becomeFirstResponder() -> Bool {
+        self.stringValue = "Press hotkey..."
+        self.focusRingType = .none
+        return super.becomeFirstResponder()
+    }
+    
+    override func textDidEndEditing(_ notification: Notification) {
+        // This is now handled by the updateNSView method in the wrapper.
+    }
+
+    // This method is called when modifier keys like Control, Option, Shift, or Command are pressed or released.
+    override func flagsChanged(with event: NSEvent) {
+        // Update the live display with only the current modifiers.
+        let sanitizedModifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        self.stringValue = HotkeyManager.hotkeyToString(keyCode: -1, modifiers: sanitizedModifiers)
+        super.flagsChanged(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        // A hotkey must have at least one modifier key.
+        let sanitizedModifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard !sanitizedModifiers.isEmpty else { return }
+        
+        let newKeyCode = Int(event.keyCode)
+        
+        // --- FIX: This is the definitive fix for the display bug. ---
+        // 1. Immediately notify the SwiftUI binding that the value has changed.
+        onValueChange(newKeyCode, sanitizedModifiers)
+        
+        // 2. Then, resign focus to "lock in" the new value.
+        self.window?.makeFirstResponder(nil)
+    }
 }
 
+// A helper class for managing hotkeys.
 class HotkeyManager {
-    static func hotkeyToString(keyCode: Int) -> String {
-        let modifiers = "⌃ ⌥ "
-        if let char = characterForKeyCode(keyCode: keyCode) {
-            return modifiers + char
+    static func hotkeyToString(keyCode: Int, modifiers: NSEvent.ModifierFlags) -> String {
+        var string = ""
+        if modifiers.contains(.control) { string += "⌃ " }
+        if modifiers.contains(.option) { string += "⌥ " }
+        if modifiers.contains(.shift) { string += "⇧ " }
+        if modifiers.contains(.command) { string += "⌘ " }
+        
+        // If the key code is -1, it means we're only displaying modifiers.
+        if keyCode != -1, let char = characterForKeyCode(keyCode: keyCode) {
+            return string + char
         }
-        return modifiers + "Key \(keyCode)"
+        
+        return string
     }
     
     static func characterForKeyCode(keyCode: Int) -> String? { return keyMap[keyCode] }
